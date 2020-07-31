@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Call Bulk API 
+Parameters:
+     
+  EnvironmentTag:
+    Default: tst
+    Description: Tag resources with environment name for easy filtering
+    Type: String
+    AllowedValues:
+      - 'tst'
+      - 'hlg'
+      - 'prd'
+
+  SetupTag:
+    Description: Setup name to be shared across master-slave regions
+    Default: jaf
+    Type: String
+  
+  S3BucketDeploy:
+    Description: Bucket where the lambdas are
+    Default: jaf-deploy
+    Type: String
+
+  S3BucketArtifactory:
+    Description: Bucket where the Artifacts/Libs are
+    Default: jaf-artifactory
+    Type: String
+
+Mappings:
+
+  RegionShortCode:
+    us-east-1:
+      value: nvi
+    us-east-2:
+      value: ohi
+    us-west-1:
+      value: nca
+    us-west-2:
+      value: ore
+    eu-west-1: 
+      value: ire
+    eu-central-1:
+      value: fkt
+    ap-northeast-1:
+      value: tko
+    ap-northeast-2:
+      value: seo
+    ap-southeast-1:
+      value: sgo
+    ap-southeast-2:
+      value: syd
+    ap-south-1:
+      value: mmb
+    sa-east-1:
+      value: spo
+    cn-north-1:
+      value: bjg
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Setup Environment
+        Parameters:
+          - EnvironmentTag
+          - SetupTag
+          - S3BucketDeploy
+      
+Resources:
+
+  BulkScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+        - '-'
+        - - !FindInMap [ RegionShortCode, !Ref 'AWS::Region', value ]
+          - !Ref 'EnvironmentTag'
+          - !Ref 'SetupTag'
+          - bulk-schedule
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+
+  BulkSchedulePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Join
+        - '-'
+        - - !FindInMap [ RegionShortCode, !Ref 'AWS::Region', value ]
+          - !Ref 'EnvironmentTag'
+          - !Ref 'SetupTag'
+          - bulk-schedule
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:CreateLogGroup
+            - logs:PutLogEvents
+            - ec2:CreateNetworkInterface
+            - ec2:DescribeNetworkInterfaces
+            - ec2:DeleteNetworkInterface
+            Resource: '*'
+      Roles:
+        - !Ref 'BulkScheduleRole'
+    DependsOn: BulkScheduleRole
+
+  BulkScheduleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join
+        - '-'
+        - - !FindInMap [ RegionShortCode, !Ref 'AWS::Region', value ]
+          - !Ref 'EnvironmentTag'
+          - !Ref 'SetupTag'
+          - bulk-schedule
+      Handler: index.lambda_handler
+      Role: !GetAtt BulkScheduleRole.Arn
+      Environment:
+        Variables:
+          dbHost: !Ref dbHost
+          dbName: !Ref dbName
+          dbUser: !Ref dbUser
+          dbPass: !Ref dbPass
+          bulkUrl: !Sub "http://${InternalLoadBalancerDNSName}/services/content/broadcast"
+      Code:
+        S3Bucket: !Ref 'S3BucketDeploy'
+        S3Key: 'lambdas/bulk-scheduler-1.1.zip'
+      Runtime: python3.7
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref 'PrivateHostsSecurityGroup' 
+        SubnetIds:
+          - !Ref 'PrivateSubnet1A'
+          - !Ref 'PrivateSubnet1B'
+      Timeout: 25
+
+  BulkScheduleTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Join
+        - '-'
+        - - !FindInMap [ RegionShortCode, !Ref 'AWS::Region', value ]
+          - !Ref 'EnvironmentTag'
+          - !Ref 'SetupTag'
+          - bulk-schedule
+      TopicName: !Join
+        - '-'
+        - - !FindInMap [ RegionShortCode, !Ref 'AWS::Region', value ]
+          - !Ref 'EnvironmentTag'
+          - !Ref 'SetupTag'
+          - bulk-schedule
+      Subscription:
+        - Endpoint: !Ref 'SNSEmail'
+          Protocol: email
+
+  BulkScheduledRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Scheduled Bulks"
+      Name: !Join
+        - '-'
+        - - !FindInMap [ RegionShortCode, !Ref 'AWS::Region', value ]
+          - !Ref 'EnvironmentTag'
+          - !Ref 'SetupTag'
+          - bulk-schedule
+      ScheduleExpression: "cron(0 9 * * ? *)"
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "BulkScheduleFunction"
+              - "Arn"
+          Id: "TargetFunctionV1"
+          Input: '{"cod": "10749"}'
+
+  BulkScheduleFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BulkScheduleFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: 
+        Fn::GetAtt: 
+          - "BulkScheduledRule"
+          - "Arn"
